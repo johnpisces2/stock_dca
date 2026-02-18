@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+import ccxt
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from pandas.tseries.offsets import DateOffset
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -41,7 +41,10 @@ SYMBOL_GROUPS: dict[str, list[str]] = {
         "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA", "AVGO", "BRK.B",
         "JPM", "V", "MA", "LLY", "UNH", "XOM", "WMT", "COST", "NFLX", "AMD", "ORCL",
     ],
+    "Crypto": ["BTC/USDT", "ETH/USDT"],
 }
+
+TRADING_FEE_RATE = 0.001  # 0.1%
 
 
 @dataclass
@@ -63,11 +66,18 @@ class TradeRecord:
     planned_date: pd.Timestamp
     trade_date: pd.Timestamp
     price: float
-    units: int
+    units: float
     spent: float
+    fee: float
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    return "/" in symbol
 
 
 def is_us_symbol(symbol: str) -> bool:
+    if is_crypto_symbol(symbol):
+        return True
     return not symbol.endswith(".TW")
 
 
@@ -78,45 +88,68 @@ def to_yf_symbol(symbol: str) -> str:
     return symbol
 
 
-def fetch_usd_twd_rate() -> float:
-    df = yf.download("TWD=X", period="7d", interval="1d", auto_adjust=False, progress=False, actions=False)
-    if df.empty:
-        raise ValueError("Unable to fetch USD/TWD exchange rate.")
+def to_exchange_candidates(symbol: str) -> list[tuple[str, str]]:
+    base = symbol.split("/")[0].upper()
+    requested_quote = symbol.split("/")[1].upper() if "/" in symbol else "USDT"
 
-    if isinstance(df.columns, pd.MultiIndex):
-        close = df[("Close", "TWD=X")] if ("Close", "TWD=X") in df.columns else df[("Adj Close", "TWD=X")]
-    else:
-        close = df["Close"] if "Close" in df.columns else df["Adj Close"]
-
-    close = close.dropna()
-    if close.empty:
-        raise ValueError("USD/TWD exchange rate data is empty.")
-
-    rate = float(close.iloc[-1])
-    if rate <= 0:
-        raise ValueError("Invalid USD/TWD exchange rate.")
-    return rate
+    candidates: list[tuple[str, str]] = []
+    # Prefer USDT pairs on Binance; if unavailable, fallback to USD pairs.
+    for market in (f"{base}/{requested_quote}", f"{base}/USD", f"{base}/USDT"):
+        if ("binance", market) not in candidates:
+            candidates.append(("binance", market))
+    for ex_id, market in (("kraken", f"{base}/USD"), ("coinbase", f"{base}/USD")):
+        if (ex_id, market) not in candidates:
+            candidates.append((ex_id, market))
+    return candidates
 
 
-def generate_schedule(start: pd.Timestamp, end: pd.Timestamp, months: int) -> list[pd.Timestamp]:
-    dates: list[pd.Timestamp] = []
-    cur = pd.Timestamp(start)
-    while cur <= end:
-        dates.append(cur)
-        cur = cur + DateOffset(months=months)
-    return dates
+def fetch_crypto_close_series(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    since = int((start - pd.Timedelta(days=10)).timestamp() * 1000)
+    end_ms = int((end + pd.Timedelta(days=1)).timestamp() * 1000)
+    errors: list[str] = []
+
+    for exchange_id, market in to_exchange_candidates(symbol):
+        try:
+            ex_class = getattr(ccxt, exchange_id)
+            exchange = ex_class({"enableRateLimit": True})
+            exchange.load_markets()
+            if market not in exchange.markets:
+                errors.append(f"{exchange_id}: {market} not available")
+                continue
+
+            rows: list[list[float]] = []
+            cursor = since
+            while cursor < end_ms:
+                batch = exchange.fetch_ohlcv(market, timeframe="1d", since=cursor, limit=1000)
+                if not batch:
+                    break
+                rows.extend(batch)
+                next_cursor = int(batch[-1][0]) + 86_400_000
+                if next_cursor <= cursor:
+                    break
+                cursor = next_cursor
+
+            if not rows:
+                errors.append(f"{exchange_id}: no OHLCV data")
+                continue
+
+            df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+            df = df.drop_duplicates(subset="ts", keep="last")
+            dt = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
+            close = pd.Series(df["close"].astype(float).values, index=dt, name="close").sort_index()
+            close = close[(close.index >= start) & (close.index <= end)].dropna()
+            if close.empty:
+                errors.append(f"{exchange_id}: no data in selected range")
+                continue
+            return close
+        except Exception as exc:
+            errors.append(f"{exchange_id}: {exc}")
+
+    err = "; ".join(errors) if errors else "unknown error"
+    raise ValueError(f"{symbol}: Unable to fetch crypto history via ccxt ({err}).")
 
 
-def nearest_trade_days(index: pd.DatetimeIndex, scheduled: list[pd.Timestamp]) -> list[pd.Timestamp]:
-    aligned: list[pd.Timestamp] = []
-    for dt in scheduled:
-        pos = index.searchsorted(dt)
-        if pos < len(index):
-            aligned.append(index[pos])
-    return sorted(set(aligned))
-
-
-def fetch_close_series(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+def fetch_stock_close_series(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
     yf_symbol = to_yf_symbol(symbol)
     df = yf.download(
         yf_symbol,
@@ -145,6 +178,56 @@ def fetch_close_series(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> p
     return close
 
 
+def fetch_usd_twd_rate() -> float:
+    df = yf.download("TWD=X", period="7d", interval="1d", auto_adjust=False, progress=False, actions=False)
+    if df.empty:
+        raise ValueError("Unable to fetch USD/TWD exchange rate.")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        close = df[("Close", "TWD=X")] if ("Close", "TWD=X") in df.columns else df[("Adj Close", "TWD=X")]
+    else:
+        close = df["Close"] if "Close" in df.columns else df["Adj Close"]
+
+    close = close.dropna()
+    if close.empty:
+        raise ValueError("USD/TWD exchange rate data is empty.")
+
+    rate = float(close.iloc[-1])
+    if rate <= 0:
+        raise ValueError("Invalid USD/TWD exchange rate.")
+    return rate
+
+
+def generate_schedule(start: pd.Timestamp, end: pd.Timestamp, period_days: int) -> list[pd.Timestamp]:
+    dates: list[pd.Timestamp] = []
+    cur = pd.Timestamp(start)
+    while cur <= end:
+        dates.append(cur)
+        cur = cur + pd.Timedelta(days=period_days)
+    return dates
+
+
+def nearest_trade_days(index: pd.DatetimeIndex, scheduled: list[pd.Timestamp]) -> list[pd.Timestamp]:
+    aligned: list[pd.Timestamp] = []
+    for dt in scheduled:
+        pos = index.searchsorted(dt)
+        if pos < len(index):
+            aligned.append(index[pos])
+    return sorted(set(aligned))
+
+
+def fetch_close_series(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    if is_crypto_symbol(symbol):
+        return fetch_crypto_close_series(symbol, start, end)
+    return fetch_stock_close_series(symbol, start, end)
+
+
+def format_units(symbol: str, units: float) -> str:
+    if is_crypto_symbol(symbol):
+        return f"{units:.8f}"
+    return f"{units:.1f}"
+
+
 def validate_history_start(symbol: str, start: pd.Timestamp, close: pd.Series, grace_days: int = 40) -> None:
     if close.empty:
         return
@@ -160,7 +243,7 @@ def run_dca_backtest(
     symbol: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
-    period_months: int,
+    period_days: int,
     contribution_ntd: float,
     usd_twd_rate: float,
 ) -> BacktestResult:
@@ -170,7 +253,7 @@ def run_dca_backtest(
         raise ValueError(f"{symbol}: No trading data in the selected date range.")
     validate_history_start(symbol, start, close)
 
-    scheduled = generate_schedule(start, end, period_months)
+    scheduled = generate_schedule(start, end, period_days)
     aligned_schedule: list[tuple[pd.Timestamp, pd.Timestamp]] = []
     for planned_dt in scheduled:
         pos = close.index.searchsorted(planned_dt)
@@ -180,7 +263,7 @@ def run_dca_backtest(
     if not aligned_schedule:
         raise ValueError(f"{symbol}: Unable to align any DCA dates to trading days.")
 
-    shares = 0
+    shares = 0.0
     invested = 0.0
     executed_periods = 0
     trade_records: list[TradeRecord] = []
@@ -190,11 +273,16 @@ def run_dca_backtest(
         if price <= 0:
             continue
         contribution_in_quote = contribution_ntd if not is_us_symbol(symbol) else (contribution_ntd / usd_twd_rate)
-        units = int(contribution_in_quote // price)
+        if is_crypto_symbol(symbol):
+            units = contribution_in_quote / price
+        else:
+            units = np.floor((contribution_in_quote / price) * 10) / 10
         if units <= 0:
             continue
+        spent = units * price
+        fee = spent * TRADING_FEE_RATE
         shares += units
-        invested += units * price
+        invested += spent + fee
         executed_periods += 1
         trade_records.append(
             TradeRecord(
@@ -202,12 +290,15 @@ def run_dca_backtest(
                 trade_date=dt,
                 price=price,
                 units=units,
-                spent=units * price,
+                spent=spent,
+                fee=fee,
             )
         )
 
     if shares <= 0 or invested <= 0:
-        raise ValueError(f"{symbol}: Amount (NTD) is too low to buy at least 1 share per DCA period.")
+        if is_crypto_symbol(symbol):
+            raise ValueError(f"{symbol}: Amount (NTD) is too low to buy crypto in selected periods.")
+        raise ValueError(f"{symbol}: Amount (NTD) is too low to buy at least 0.1 share per DCA period.")
 
     last_price = float(close.iloc[-1])
     final_value = shares * last_price
@@ -227,7 +318,7 @@ def run_dca_backtest(
         annualized_pct=annualized * 100,
         periods_executed=executed_periods,
         periods_planned=len(scheduled),
-        currency="USD" if is_us_symbol(symbol) else "TWD",
+        currency="USDT" if is_crypto_symbol(symbol) else ("USD" if is_us_symbol(symbol) else "TWD"),
         trades=trade_records,
     )
 
@@ -236,7 +327,7 @@ def write_trades_markdown(
     results: list[BacktestResult],
     start: pd.Timestamp,
     end: pd.Timestamp,
-    period_months: int,
+    period_days: int,
     contribution_ntd: float,
     usd_twd_rate: float,
 ) -> Path:
@@ -248,9 +339,10 @@ def write_trades_markdown(
     lines.append("# DCA Trade Details")
     lines.append("")
     lines.append(f"- Date range: {start.date()} to {end.date()}")
-    lines.append(f"- DCA period: every {period_months} month(s)")
+    lines.append(f"- DCA period: every {period_days} day(s)")
     lines.append(f"- Contribution per period (NTD): {contribution_ntd:,.0f}")
     lines.append(f"- USD/TWD rate used: {usd_twd_rate:.4f}")
+    lines.append(f"- Trading fee rate: {TRADING_FEE_RATE * 100:.2f}%")
     lines.append("")
 
     for r in results:
@@ -262,12 +354,12 @@ def write_trades_markdown(
         lines.append(f"- Final value: {r.final_value:,.0f} {r.currency}")
         lines.append(f"- Profit: {r.profit:,.0f} {r.currency}")
         lines.append("")
-        lines.append("| # | Planned Date | Trade Date | Price | Units | Spent |")
-        lines.append("|---|---|---|---:|---:|---:|")
+        lines.append("| # | Planned Date | Trade Date | Price | Units | Spent | Fee |")
+        lines.append("|---|---|---|---:|---:|---:|---:|")
         for i, t in enumerate(r.trades, start=1):
             lines.append(
                 f"| {i} | {t.planned_date.date()} | {t.trade_date.date()} | "
-                f"{t.price:,.2f} | {t.units} | {t.spent:,.2f} |"
+                f"{t.price:,.2f} | {format_units(r.symbol, t.units)} | {t.spent:,.2f} | {t.fee:,.2f} |"
             )
         lines.append("")
 
@@ -297,9 +389,8 @@ class MainWindow(QMainWindow):
         self.end_date.setDate(date.today())
 
         self.period_spin = QSpinBox()
-        self.period_spin.setRange(1, 24)
-        self.period_spin.setValue(1)
-        self.period_spin.setSuffix(" month(s)")
+        self.period_spin.setRange(1, 3650)
+        self.period_spin.setValue(30)
 
         self.amount_spin = QDoubleSpinBox()
         self.amount_spin.setRange(100, 10_000_000)
@@ -316,7 +407,7 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.start_date, 0, 1)
         control_layout.addWidget(QLabel("End Date"), 0, 2)
         control_layout.addWidget(self.end_date, 0, 3)
-        control_layout.addWidget(QLabel("DCA Period"), 1, 0)
+        control_layout.addWidget(QLabel("DCA Period (Days)"), 1, 0)
         control_layout.addWidget(self.period_spin, 1, 1)
         control_layout.addWidget(QLabel("Amount (NTD)"), 1, 2)
         control_layout.addWidget(self.amount_spin, 1, 3)
@@ -389,8 +480,8 @@ class MainWindow(QMainWindow):
         self.log_box.clear()
 
         usd_twd_rate = 1.0
-        has_us_symbols = any(is_us_symbol(sym) for sym in symbols)
-        if has_us_symbols:
+        has_usd_quote_assets = any(is_us_symbol(sym) for sym in symbols)
+        if has_usd_quote_assets:
             try:
                 usd_twd_rate = fetch_usd_twd_rate()
                 self.log_box.append(f"[INFO] Using USD/TWD rate: {usd_twd_rate:.4f}")
@@ -399,6 +490,7 @@ class MainWindow(QMainWindow):
                 return
 
         self.log_box.append(f"[INFO] Contribution per period: {contribution:,.0f} NTD")
+        self.log_box.append(f"[INFO] Trading fee rate applied: {TRADING_FEE_RATE * 100:.2f}%")
 
         results: list[BacktestResult] = []
         for sym in symbols:
