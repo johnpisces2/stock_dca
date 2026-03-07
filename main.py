@@ -10,9 +10,11 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
     QDateEdit,
     QDoubleSpinBox,
     QGridLayout,
@@ -45,11 +47,21 @@ SYMBOL_GROUPS: dict[str, list[str]] = {
 }
 
 TRADING_FEE_RATE = 0.001  # 0.1%
+EMA_WINDOW = 200
+EMA_LOOKBACK_DAYS = 400
+
+STRATEGY_PERIODIC_ALL_IN = "periodic_all_in"
+STRATEGY_EMA200_ACCUMULATE = "ema200_accumulate"
+STRATEGY_LABELS: dict[str, str] = {
+    STRATEGY_PERIODIC_ALL_IN: "Periodic Buy (Use available cash every cycle)",
+    STRATEGY_EMA200_ACCUMULATE: "EMA200 Trigger (Accumulate cash until price <= EMA200)",
+}
 
 
 @dataclass
 class BacktestResult:
     symbol: str
+    strategy_label: str
     invested: float
     final_value: float
     profit: float
@@ -58,17 +70,52 @@ class BacktestResult:
     periods_executed: int
     periods_planned: int
     currency: str
+    cash_remaining: float
     trades: list["TradeRecord"]
 
 
 @dataclass
 class TradeRecord:
-    planned_date: pd.Timestamp
+    planned_dates: list[pd.Timestamp]
     trade_date: pd.Timestamp
     price: float
     units: float
     spent: float
     fee: float
+
+
+@dataclass
+class AlignedTradeDay:
+    planned_dates: list[pd.Timestamp]
+    trade_date: pd.Timestamp
+
+
+class CopyableTableWidget(QTableWidget):
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self.copy_selection()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def copy_selection(self) -> None:
+        indexes = self.selectedIndexes()
+        if not indexes:
+            return
+
+        indexes = sorted(indexes, key=lambda idx: (idx.row(), idx.column()))
+        rows: dict[int, dict[int, str]] = {}
+        selected_columns = sorted({idx.column() for idx in indexes})
+
+        for idx in indexes:
+            rows.setdefault(idx.row(), {})[idx.column()] = idx.data() or ""
+
+        lines: list[str] = []
+        for row_no in sorted(rows):
+            row_values = [rows[row_no].get(col, "") for col in selected_columns]
+            lines.append("\t".join(row_values))
+
+        QGuiApplication.clipboard().setText("\n".join(lines))
 
 
 def is_crypto_symbol(symbol: str) -> bool:
@@ -239,7 +286,107 @@ def validate_history_start(symbol: str, start: pd.Timestamp, close: pd.Series, g
         )
 
 
-def run_dca_backtest(
+def contribution_in_quote(symbol: str, contribution_ntd: float, usd_twd_rate: float) -> float:
+    return contribution_ntd if not is_us_symbol(symbol) else (contribution_ntd / usd_twd_rate)
+
+
+def build_aligned_schedule(
+    index: pd.DatetimeIndex,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    period_days: int,
+) -> tuple[list[pd.Timestamp], list[AlignedTradeDay]]:
+    scheduled = generate_schedule(start, end, period_days)
+    grouped_schedule: dict[pd.Timestamp, list[pd.Timestamp]] = {}
+    for planned_dt in scheduled:
+        pos = index.searchsorted(planned_dt)
+        if pos < len(index):
+            trade_dt = pd.Timestamp(index[pos])
+            grouped_schedule.setdefault(trade_dt, []).append(planned_dt)
+
+    aligned_schedule = [
+        AlignedTradeDay(planned_dates=planned_dates, trade_date=trade_dt)
+        for trade_dt, planned_dates in sorted(grouped_schedule.items())
+    ]
+    return scheduled, aligned_schedule
+
+
+def format_planned_dates(planned_dates: list[pd.Timestamp]) -> str:
+    if not planned_dates:
+        return "-"
+
+    first = planned_dates[0].date().isoformat()
+    if len(planned_dates) == 1:
+        return first
+
+    last = planned_dates[-1].date().isoformat()
+    return f"{first} to {last} ({len(planned_dates)} periods)"
+
+
+def calc_order_from_budget(symbol: str, price: float, budget: float) -> tuple[float, float, float]:
+    if price <= 0 or budget <= 0:
+        return 0.0, 0.0, 0.0
+
+    max_spent_before_fee = budget / (1.0 + TRADING_FEE_RATE)
+    if max_spent_before_fee <= 0:
+        return 0.0, 0.0, 0.0
+
+    if is_crypto_symbol(symbol):
+        units = max_spent_before_fee / price
+    else:
+        units = np.floor((max_spent_before_fee / price) * 10) / 10
+
+    if units <= 0:
+        return 0.0, 0.0, 0.0
+
+    spent = units * price
+    fee = spent * TRADING_FEE_RATE
+    total_cost = spent + fee
+    if total_cost > budget + 1e-9:
+        return 0.0, 0.0, 0.0
+    return units, spent, fee
+
+
+def finalize_backtest_result(
+    symbol: str,
+    strategy_label: str,
+    close: pd.Series,
+    total_contributed: float,
+    shares: float,
+    cash: float,
+    executed_periods: int,
+    scheduled_count: int,
+    trade_records: list[TradeRecord],
+) -> BacktestResult:
+    if total_contributed <= 0:
+        raise ValueError(f"{symbol}: No capital was contributed in the selected period.")
+
+    last_price = float(close.iloc[-1])
+    final_value = shares * last_price + cash
+    profit = final_value - total_contributed
+    ret = (final_value / total_contributed - 1.0) if total_contributed > 0 else 0.0
+
+    days = max((close.index[-1] - close.index[0]).days, 1)
+    years = days / 365.25
+    annualized = ((final_value / total_contributed) ** (1 / years) - 1.0) if total_contributed > 0 and years > 0 else 0.0
+
+    return BacktestResult(
+        symbol=symbol,
+        strategy_label=strategy_label,
+        invested=total_contributed,
+        final_value=final_value,
+        profit=profit,
+        return_pct=ret * 100,
+        annualized_pct=annualized * 100,
+        periods_executed=executed_periods,
+        periods_planned=scheduled_count,
+        currency="USDT" if is_crypto_symbol(symbol) else ("USD" if is_us_symbol(symbol) else "TWD"),
+        cash_remaining=cash,
+        trades=trade_records,
+    )
+
+
+def run_periodic_all_in_backtest(
     symbol: str,
     start: pd.Timestamp,
     end: pd.Timestamp,
@@ -253,40 +400,36 @@ def run_dca_backtest(
         raise ValueError(f"{symbol}: No trading data in the selected date range.")
     validate_history_start(symbol, start, close)
 
-    scheduled = generate_schedule(start, end, period_days)
-    aligned_schedule: list[tuple[pd.Timestamp, pd.Timestamp]] = []
-    for planned_dt in scheduled:
-        pos = close.index.searchsorted(planned_dt)
-        if pos < len(close.index):
-            aligned_schedule.append((planned_dt, close.index[pos]))
-
+    scheduled, aligned_schedule = build_aligned_schedule(close.index, start, end, period_days)
     if not aligned_schedule:
         raise ValueError(f"{symbol}: Unable to align any DCA dates to trading days.")
 
+    cash = 0.0
     shares = 0.0
-    invested = 0.0
+    total_contributed = 0.0
     executed_periods = 0
     trade_records: list[TradeRecord] = []
+    contribution_quote = contribution_in_quote(symbol, contribution_ntd, usd_twd_rate)
+    pending_planned_dates: list[pd.Timestamp] = []
 
-    for planned_dt, dt in aligned_schedule:
+    for aligned_day in aligned_schedule:
+        dt = aligned_day.trade_date
         price = float(close.loc[dt])
-        if price <= 0:
-            continue
-        contribution_in_quote = contribution_ntd if not is_us_symbol(symbol) else (contribution_ntd / usd_twd_rate)
-        if is_crypto_symbol(symbol):
-            units = contribution_in_quote / price
-        else:
-            units = np.floor((contribution_in_quote / price) * 10) / 10
+        contribution_total = contribution_quote * len(aligned_day.planned_dates)
+        cash += contribution_total
+        total_contributed += contribution_total
+        pending_planned_dates.extend(aligned_day.planned_dates)
+
+        units, spent, fee = calc_order_from_budget(symbol, price, cash)
         if units <= 0:
             continue
-        spent = units * price
-        fee = spent * TRADING_FEE_RATE
+
         shares += units
-        invested += spent + fee
-        executed_periods += 1
+        cash -= spent + fee
+        executed_periods += len(pending_planned_dates)
         trade_records.append(
             TradeRecord(
-                planned_date=planned_dt,
+                planned_dates=list(pending_planned_dates),
                 trade_date=dt,
                 price=price,
                 units=units,
@@ -294,33 +437,115 @@ def run_dca_backtest(
                 fee=fee,
             )
         )
+        pending_planned_dates.clear()
 
-    if shares <= 0 or invested <= 0:
+    if shares <= 0 and cash <= 0:
         if is_crypto_symbol(symbol):
             raise ValueError(f"{symbol}: Amount (NTD) is too low to buy crypto in selected periods.")
-        raise ValueError(f"{symbol}: Amount (NTD) is too low to buy at least 0.1 share per DCA period.")
+        raise ValueError(f"{symbol}: Amount (NTD) is too low to buy at least 0.1 share in selected periods.")
 
-    last_price = float(close.iloc[-1])
-    final_value = shares * last_price
-    profit = final_value - invested
-    ret = (final_value / invested - 1.0) if invested > 0 else 0.0
-
-    days = max((close.index[-1] - close.index[0]).days, 1)
-    years = days / 365.25
-    annualized = ((final_value / invested) ** (1 / years) - 1.0) if invested > 0 and years > 0 else 0.0
-
-    return BacktestResult(
+    return finalize_backtest_result(
         symbol=symbol,
-        invested=invested,
-        final_value=final_value,
-        profit=profit,
-        return_pct=ret * 100,
-        annualized_pct=annualized * 100,
-        periods_executed=executed_periods,
-        periods_planned=len(scheduled),
-        currency="USDT" if is_crypto_symbol(symbol) else ("USD" if is_us_symbol(symbol) else "TWD"),
-        trades=trade_records,
+        strategy_label=STRATEGY_LABELS[STRATEGY_PERIODIC_ALL_IN],
+        close=close,
+        total_contributed=total_contributed,
+        shares=shares,
+        cash=cash,
+        executed_periods=executed_periods,
+        scheduled_count=len(scheduled),
+        trade_records=trade_records,
     )
+
+
+def run_ema200_accumulate_backtest(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    period_days: int,
+    contribution_ntd: float,
+    usd_twd_rate: float,
+) -> BacktestResult:
+    history_start = start - pd.Timedelta(days=EMA_LOOKBACK_DAYS)
+    history_close = fetch_close_series(symbol, history_start, end)
+    if history_close.empty:
+        raise ValueError(f"{symbol}: No trading data in the selected date range.")
+
+    validate_history_start(symbol, start, history_close)
+    close = history_close[(history_close.index >= start) & (history_close.index <= end)]
+    if close.empty:
+        raise ValueError(f"{symbol}: No trading data in the selected date range.")
+
+    scheduled, aligned_schedule = build_aligned_schedule(close.index, start, end, period_days)
+    if not aligned_schedule:
+        raise ValueError(f"{symbol}: Unable to align any DCA dates to trading days.")
+
+    ema200 = history_close.ewm(span=EMA_WINDOW, adjust=False, min_periods=EMA_WINDOW).mean()
+    cash = 0.0
+    shares = 0.0
+    total_contributed = 0.0
+    executed_periods = 0
+    trade_records: list[TradeRecord] = []
+    contribution_quote = contribution_in_quote(symbol, contribution_ntd, usd_twd_rate)
+    pending_planned_dates: list[pd.Timestamp] = []
+
+    for aligned_day in aligned_schedule:
+        dt = aligned_day.trade_date
+        price = float(close.loc[dt])
+        contribution_total = contribution_quote * len(aligned_day.planned_dates)
+        cash += contribution_total
+        total_contributed += contribution_total
+        pending_planned_dates.extend(aligned_day.planned_dates)
+
+        ema_price = float(ema200.loc[dt]) if dt in ema200.index and pd.notna(ema200.loc[dt]) else np.nan
+        if np.isnan(ema_price) or price > ema_price:
+            continue
+
+        units, spent, fee = calc_order_from_budget(symbol, price, cash)
+        if units <= 0:
+            continue
+
+        shares += units
+        cash -= spent + fee
+        executed_periods += len(pending_planned_dates)
+        trade_records.append(
+            TradeRecord(
+                planned_dates=list(pending_planned_dates),
+                trade_date=dt,
+                price=price,
+                units=units,
+                spent=spent,
+                fee=fee,
+            )
+        )
+        pending_planned_dates.clear()
+
+    return finalize_backtest_result(
+        symbol=symbol,
+        strategy_label=STRATEGY_LABELS[STRATEGY_EMA200_ACCUMULATE],
+        close=close,
+        total_contributed=total_contributed,
+        shares=shares,
+        cash=cash,
+        executed_periods=executed_periods,
+        scheduled_count=len(scheduled),
+        trade_records=trade_records,
+    )
+
+
+def run_dca_backtest(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    period_days: int,
+    contribution_ntd: float,
+    usd_twd_rate: float,
+    strategy: str,
+) -> BacktestResult:
+    if strategy == STRATEGY_PERIODIC_ALL_IN:
+        return run_periodic_all_in_backtest(symbol, start, end, period_days, contribution_ntd, usd_twd_rate)
+    if strategy == STRATEGY_EMA200_ACCUMULATE:
+        return run_ema200_accumulate_backtest(symbol, start, end, period_days, contribution_ntd, usd_twd_rate)
+    raise ValueError(f"Unsupported strategy: {strategy}")
 
 
 def write_trades_markdown(
@@ -339,6 +564,7 @@ def write_trades_markdown(
     lines.append("# DCA Trade Details")
     lines.append("")
     lines.append(f"- Date range: {start.date()} to {end.date()}")
+    lines.append(f"- Strategy: {results[0].strategy_label}")
     lines.append(f"- DCA period: every {period_days} day(s)")
     lines.append(f"- Contribution per period (NTD): {contribution_ntd:,.0f}")
     lines.append(f"- USD/TWD rate used: {usd_twd_rate:.4f}")
@@ -352,13 +578,14 @@ def write_trades_markdown(
         )
         lines.append(f"- Total invested: {r.invested:,.0f} {r.currency}")
         lines.append(f"- Final value: {r.final_value:,.0f} {r.currency}")
+        lines.append(f"- Cash remaining: {r.cash_remaining:,.2f} {r.currency}")
         lines.append(f"- Profit: {r.profit:,.0f} {r.currency}")
         lines.append("")
-        lines.append("| # | Planned Date | Trade Date | Price | Units | Spent | Fee |")
+        lines.append("| # | Planned Date(s) | Trade Date | Price | Units | Spent | Fee |")
         lines.append("|---|---|---|---:|---:|---:|---:|")
         for i, t in enumerate(r.trades, start=1):
             lines.append(
-                f"| {i} | {t.planned_date.date()} | {t.trade_date.date()} | "
+                f"| {i} | {format_planned_dates(t.planned_dates)} | {t.trade_date.date()} | "
                 f"{t.price:,.2f} | {format_units(r.symbol, t.units)} | {t.spent:,.2f} | {t.fee:,.2f} |"
             )
         lines.append("")
@@ -398,6 +625,10 @@ class MainWindow(QMainWindow):
         self.amount_spin.setValue(10_000)
         self.amount_spin.setSingleStep(1000)
 
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.addItem(STRATEGY_LABELS[STRATEGY_PERIODIC_ALL_IN], STRATEGY_PERIODIC_ALL_IN)
+        self.strategy_combo.addItem(STRATEGY_LABELS[STRATEGY_EMA200_ACCUMULATE], STRATEGY_EMA200_ACCUMULATE)
+
         self.run_btn = QPushButton("Run Backtest")
         self.run_btn.clicked.connect(self.on_run)
         self.clear_btn = QPushButton("Clear Output")
@@ -411,6 +642,8 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.period_spin, 1, 1)
         control_layout.addWidget(QLabel("Amount (NTD)"), 1, 2)
         control_layout.addWidget(self.amount_spin, 1, 3)
+        control_layout.addWidget(QLabel("Strategy"), 2, 0)
+        control_layout.addWidget(self.strategy_combo, 2, 1, 1, 3)
         control_layout.addWidget(self.run_btn, 0, 4, 1, 1)
         control_layout.addWidget(self.clear_btn, 1, 4, 1, 1)
 
@@ -434,9 +667,9 @@ class MainWindow(QMainWindow):
         picks_layout.addWidget(self.symbol_list, 1)
 
         right_layout = QVBoxLayout()
-        self.result_table = QTableWidget(0, 7)
+        self.result_table = CopyableTableWidget(0, 8)
         self.result_table.setHorizontalHeaderLabels(
-            ["Symbol", "Total Invested", "Final Value", "Profit", "Total Return", "Annualized Return", "Periods"]
+            ["Symbol", "Total Invested", "Final Value", "Cash Left", "Profit", "Portfolio Return", "Annualized Return", "Periods"]
         )
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -476,6 +709,8 @@ class MainWindow(QMainWindow):
 
         period = self.period_spin.value()
         contribution = float(self.amount_spin.value())
+        strategy = str(self.strategy_combo.currentData())
+        strategy_label = self.strategy_combo.currentText()
         self.result_table.setRowCount(0)
         self.log_box.clear()
 
@@ -489,13 +724,16 @@ class MainWindow(QMainWindow):
                 self.log_box.append(f"[ERR] FX rate: {exc}")
                 return
 
+        self.log_box.append(f"[INFO] Strategy: {strategy_label}")
         self.log_box.append(f"[INFO] Contribution per period: {contribution:,.0f} NTD")
         self.log_box.append(f"[INFO] Trading fee rate applied: {TRADING_FEE_RATE * 100:.2f}%")
+        if strategy == STRATEGY_EMA200_ACCUMULATE:
+            self.log_box.append(f"[INFO] EMA condition: buy when close <= EMA{EMA_WINDOW}.")
 
         results: list[BacktestResult] = []
         for sym in symbols:
             try:
-                res = run_dca_backtest(sym, start, end, period, contribution, usd_twd_rate)
+                res = run_dca_backtest(sym, start, end, period, contribution, usd_twd_rate, strategy)
                 results.append(res)
                 self.log_box.append(f"[OK] {sym} backtest completed.")
             except Exception as exc:
@@ -512,6 +750,7 @@ class MainWindow(QMainWindow):
                 f"{r.symbol} ({r.currency})",
                 f"{r.invested:,.0f}",
                 f"{r.final_value:,.0f}",
+                f"{r.cash_remaining:,.2f}",
                 f"{r.profit:,.0f}",
                 f"{r.return_pct:,.0f}%",
                 f"{r.annualized_pct:,.0f}%",
