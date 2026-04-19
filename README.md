@@ -1,153 +1,151 @@
 # DCA Backtester
 
-以 Python + PySide6 製作的桌面版 DCA (Dollar-Cost Averaging) 回測工具，支援台股 ETF、美股 ETF、美股大型股與加密貨幣，並提供股利模式、歷史匯率換算、結果排序與 Markdown 報表輸出。
+以 `Python` + `PySide6` 開發的桌面版 DCA（Dollar-Cost Averaging）回測工具。  
+目前支援台股 ETF、美股 ETF、美股大型股與加密貨幣，可用固定週期投入金額進行多標的回測，並整合股利處理、歷史匯率換算、結果排序與 Markdown 交易明細報表輸出。
 
 ## Screenshot
-
-請將最新介面截圖放在專案根目錄的 `screenshot.png`，README 會顯示這張圖：
 
 ![Application Screenshot](screenshot.png)
 
 ## 功能特色
 
-- 支援多檔標的同時回測。
-- 支援 `Taiwan ETFs`、`US ETFs`、`US Large Caps`、`Crypto` 分組。
-- 股票使用原始 `Close` 作為成交價。
-- 股票股利使用 `Ticker.dividends` 個別計算，不再依賴 `Adj Close` 近似。
-- 支援兩種 `Dividend Mode`：
-  - `Cash Dividends`
-  - `Auto Reinvest Dividends`
-- 美股與加密資產使用歷史 `USD/TWD` 依交易日換算，不使用單一最新匯率。
-- 結果表支援 `Original Currency` / `Convert All To NTD` 顯示模式切換。
-- 結果表支援點擊欄位標題排序。
-- 每次回測後自動輸出 Markdown 交易報表。
-- 內建 in-memory cache，會快取股價、股利、匯率與 crypto 歷史資料，加速重跑。
+- 多檔標的同時回測，可一次比較不同資產的 DCA 表現。
+- 內建 `Taiwan ETFs`、`US ETFs`、`US Large Caps`、`Crypto` 分組清單。
+- 股票資料使用 Yahoo Finance 的歷史 `Close` 作為成交與估值價格。
+- 股票股利使用 `yfinance.Ticker(...).dividends` 取得，並依持有 units 計算。
+- 支援 `Cash Dividends` 與 `Auto Reinvest Dividends` 兩種 Dividend Mode。
+- 美股與 Crypto 依交易日歷史 `USD/TWD` 匯率換算每期投入金額。
+- 可在結果表切換 `Original Currency` 或 `Convert All To NTD` 顯示。
+- 結果表支援點擊欄位標題排序，數值欄位使用 numeric sorting。
+- 每次成功回測後會自動輸出 Markdown 交易明細到 `trade_reports/`。
+- 內建 in-memory cache，快取股票價格、股利、匯率與 Crypto OHLCV 資料，加速同 session 內重跑。
+
+## 技術棧
+
+- `Python`
+- `PySide6`：桌面 GUI
+- `pandas` / `numpy`：時間序列與回測計算
+- `yfinance`：股票價格、股票股利、USD/TWD 歷史匯率
+- `ccxt`：Crypto exchange OHLCV 資料
 
 ## 支援標的
 
-目前內建清單如下：
+目前內建標的清單定義於 `main.py` 的 `SYMBOL_GROUPS`。
 
-- `Taiwan ETFs`
-  - `0050.TW`
-  - `0056.TW`
-  - `006208.TW`
-  - `00878.TW`
-  - `00919.TW`
-- `US ETFs`
-  - `SPY`
-  - `QQQ`
-  - `TQQQ`
-  - `SOXX`
-  - `SOXL`
-  - `VOO`
-  - `VTI`
-- `US Large Caps`
-  - `AAPL`
-  - `MSFT`
-  - `AMZN`
-  - `GOOGL`
-  - `META`
-  - `NVDA`
-  - `TSLA`
-  - `AVGO`
-  - `BRK.B`
-  - `JPM`
-  - `V`
-  - `MA`
-  - `LLY`
-  - `UNH`
-  - `XOM`
-  - `WMT`
-  - `COST`
-  - `NFLX`
-  - `AMD`
-  - `ORCL`
-- `Crypto`
-  - `BTC/USDT`
-  - `ETH/USDT`
+### Taiwan ETFs
 
-補充：
+- `0050.TW`
+- `0056.TW`
+- `006208.TW`
+- `00878.TW`
+- `00919.TW`
 
-- UI 顯示 `BRK.B`，下載 Yahoo Finance 資料時會自動轉成 `BRK-B`。
+### US ETFs
+
+- `SPY`
+- `QQQ`
+- `TQQQ`
+- `SOXX`
+- `SOXL`
+- `VOO`
+- `VTI`
+
+### US Large Caps
+
+- `AAPL`
+- `MSFT`
+- `AMZN`
+- `GOOGL`
+- `META`
+- `NVDA`
+- `TSLA`
+- `AVGO`
+- `BRK.B`
+- `JPM`
+- `V`
+- `MA`
+- `LLY`
+- `UNH`
+- `XOM`
+- `WMT`
+- `COST`
+- `NFLX`
+- `AMD`
+- `ORCL`
+
+### Crypto
+
+- `BTC/USDT`
+- `ETH/USDT`
+
+補充：UI 顯示 `BRK.B`，下載 Yahoo Finance 資料時會自動轉換為 `BRK-B`。
 
 ## 回測設定
 
-介面提供以下輸入欄位：
+GUI 提供以下輸入欄位：
 
-- `Start Date`
-- `End Date`
-<<<<<<< HEAD
-- `DCA Period (Days)` (every N day(s), default: 30)
-- `Amount (NTD)` (integer display)
-- `Strategy`
+- `Start Date`：回測開始日期，預設為 `2018-01-01`。
+- `End Date`：回測結束日期，預設為今天。
+- `DCA Period`：每隔幾天投入一次，範圍為 `1` 至 `3650` 天，預設 `30` 天。
+- `Amount (NTD)`：每期投入金額，範圍為 `100` 至 `10,000,000` NTD，預設 `10,000` NTD。
+- `Dividend Mode`：
+  - `Cash Dividends`
+  - `Auto Reinvest Dividends`
+- `Display Currency`：
+  - `Original Currency`
+  - `Convert All To NTD`
 
-Strategies:
-- `Periodic Buy (Use available cash every cycle)`: add fixed capital every cycle and buy immediately with current available cash.
-- `EMA200 Trigger (Accumulate cash until price <= EMA200)`: add fixed capital every cycle, but only deploy accumulated cash when the trade-day close is less than or equal to the daily `EMA200`.
-=======
-- `DCA Period (Days)`
-- `Amount (NTD)`
-- `Dividend Mode`
-- `Display Currency`
->>>>>>> 72ce36b (Enhance DCA Backtester with Dividend Handling and Currency Conversion)
+操作按鈕：
 
-按鈕：
-
-<<<<<<< HEAD
-1. Build a planned DCA schedule from start to end date.
-2. Align each planned date to the next available trading day.
-3. If multiple planned dates align to the same trading day, their capital is merged into one order and only one trading fee is charged.
-4. For Taiwan symbols (`.TW`): use the NTD amount directly.
-5. For US symbols: convert NTD amount to USD using current `USD/TWD` rate (`TWD=X`).
-6. Each cycle adds the fixed amount into strategy cash.
-7. Stocks: buy in 0.1-share increments. Crypto: buy fractional coin amounts.
-8. Trading fee is fixed at `0.1%` per buy for both stocks and crypto.
-9. `Periodic Buy` spends available cash on every aligned trade date, and if cash is not enough to buy the minimum size, it rolls forward to later periods.
-10. `EMA200 Trigger` uses daily close data to compute `EMA200`, and only buys when `close <= EMA200`.
-11. Final metrics are calculated from accumulated shares, remaining cash, and the last available adjusted close.
-=======
-- `Run Backtest`
-- `Clear Output`
->>>>>>> 72ce36b (Enhance DCA Backtester with Dividend Handling and Currency Conversion)
+- `Run Backtest`：執行回測。
+- `Clear Output`：清空結果表與 log。
 
 ## 回測邏輯
 
-### 1. DCA schedule
+### DCA Schedule
 
-- 根據 `Start Date`、`End Date`、`DCA Period (Days)` 建立定期投入日期。
-- 每個預定投入日會對齊到下一個可交易日。
+- 根據 `Start Date`、`End Date` 與 `DCA Period` 建立固定週期投入日期。
+- 若預定投入日不是交易日，會對齊到下一個可用交易日。
+- `Periods` 會以 `executed/planned` 顯示實際成交期數與原本規劃期數。
 
-### 2. 成交價格
+### 成交價格
 
 - 股票使用歷史 `Close`。
-- Crypto 使用 `ccxt` 的日線 `OHLCV close`。
+- Crypto 使用 `ccxt` 取得日線 `OHLCV`，並使用 `close` 作為成交與估值價格。
 
-### 3. 股數規則
+### 買入單位
 
-- 股票以 `0.1 share` 為最小買入單位。
-- Crypto 支援 fractional units。
+- 股票最小買入單位為 `0.1 share`。
+- Crypto 支援 fractional units，顯示到小數 8 位。
+- 若每期投入金額不足以買進股票最小單位，該期不會成交。
 
-### 4. Trading fee
+### Trading Fee
 
-- 每次買入固定收取 `0.1%` fee。
+- 每次買入固定收取 `0.1%` trading fee。
+- Trading fee 會計入 invested cost。
+- 股利自動再投入目前不另外收取 trading fee。
 
-### 5. 股利模式
+### Dividend Mode
 
 `Cash Dividends`
 
-- 股利以現金累積。
+- 股利依當時持有 units 計算。
+- 股利以 cash 累積。
 - `Final Value = Position Value + Dividend Cash`
 
 `Auto Reinvest Dividends`
 
-- 股利在股利事件對應的交易日，依當天 `Close` 自動轉成更多 units。
-- 預設不另外收取再投入交易 fee。
+- 股利事件會對齊到下一個可交易日。
+- 若當時已有持倉，會依該交易日 `Close` 自動轉成額外 units。
+- 自動再投入取得的 units 會納入後續估值。
 
-### 6. 匯率邏輯
+### FX Conversion
 
-- 台股資產直接以 `NTD` 計算。
-- 美股與目前的 crypto 報價資產，會以歷史 `USD/TWD` 在每次交易日換算投入金額。
-- 最終 `NTD` 估值會使用資產估值日當天，若無資料則往前最近可用的 `USD/TWD`。
+- 台股標的以 `TWD` 計算，不需要匯率。
+- 美股與 Crypto 視為外幣報價資產，會使用歷史 `USD/TWD` 匯率。
+- 每期投入時，會用交易日當天或之前最近可用的 `USD/TWD` 將 NTD 轉成外幣。
+- 最終 NTD 估值會使用資產估值日當天或之前最近可用的 `USD/TWD`。
+- 若歷史匯率資料不足，程式不會使用未來匯率回補，以避免 look-ahead bias。
 
 ## 結果表
 
@@ -156,90 +154,76 @@ Strategies:
 - `Symbol`
 - `Total Invested`
 - `Final Value`
-- `Cash Left`
 - `Profit`
-- `Portfolio Return`
+- `Total Return`
 - `Annualized Return`
 - `Periods`
 
-說明：
+顯示模式：
 
-- `Periods` 顯示格式為 `executed/planned`
-- 點擊欄位標題可排序
-- 數值欄位使用數值排序，不是字串排序
-- `Display Currency = Original Currency` 時，顯示各資產原本幣別
-- `Display Currency = Convert All To NTD` 時，金額與報酬會改用 `NTD` 視角顯示
+- `Original Currency`：依資產原始幣別顯示，台股為 `TWD`、美股為 `USD`、Crypto 為 `USDT`。
+- `Convert All To NTD`：將 invested、final value、profit 與 return 轉成 NTD 視角。
 
-## 報表輸出
+排序：
 
-每次成功回測後，程式會輸出 Markdown 報表到：
+- 點擊欄位標題可排序。
+- Symbol 預設由小到大，其餘數值欄位預設由大到小。
+- 數值欄位使用實際數值排序，不使用字串排序。
 
-```text
-trade_reports/
-```
+## Markdown 報表
 
-<<<<<<< HEAD
-Report includes:
-- run settings
-- selected strategy
-- FX rate used
-- trading fee rate used
-- per-symbol summary
-- per-trade details (`planned date`, `trade date`, `price`, `units`, `spent`, `fee`)
-=======
-檔名格式：
->>>>>>> 72ce36b (Enhance DCA Backtester with Dividend Handling and Currency Conversion)
+每次成功回測後，程式會自動建立 Markdown 報表：
 
 ```text
-dca_trades_YYYYMMDD_HHMMSS.md
+trade_reports/dca_trades_YYYYMMDD_HHMMSS_microseconds.md
 ```
 
 報表內容包含：
 
 - 回測日期區間
-- `DCA period`
-- 每期投入 `NTD`
-- `Trading fee rate`
-- `Dividend mode`
-- `FX conversion` 說明
-- 每檔標的的 summary
-- 每筆交易的明細
+- DCA period
+- 每期投入金額
+- Trading fee rate
+- Dividend mode
+- FX conversion 說明
+- 每檔標的 summary
+- 股利、再投入 units、最終估值與損益
+- 每筆交易明細：`planned date`、`trade date`、`price`、`units`、`spent`、`fee`
 
-若該次回測沒有用到外幣換算，報表會顯示：
-
-```text
-FX conversion: N/A
-```
+若本次回測沒有使用外幣換算，報表會顯示 `FX conversion: N/A`。
 
 ## 資料來源
 
-- 股票與匯率：`yfinance`
+- 股票價格：`yfinance.download(...)`
 - 股票股利：`yfinance.Ticker(...).dividends`
-- Crypto：`ccxt`
+- USD/TWD 匯率：Yahoo Finance symbol `TWD=X`
+- Crypto OHLCV：`ccxt`
 
-Crypto 預設會優先嘗試：
+Crypto 資料會依序嘗試以下 exchange：
 
-- Binance
-- Kraken
-- Coinbase
+- `binance`
+- `kraken`
+- `coinbase`
 
-## 效能優化
+## 快取與效能
 
-目前已實作以下優化：
+目前程式在單次 app session 內使用 in-memory cache：
 
-- 股票價格支援 batch download
-- 股票股利支援 prefetch + parallel fetch
-- 歷史 `USD/TWD` 支援 cache
-- 同條件重跑會直接吃 in-memory cache
+- `STOCK_CLOSE_CACHE`
+- `STOCK_DIVIDEND_CACHE`
+- `CRYPTO_HISTORY_CACHE`
+- `FX_HISTORY_CACHE`
+- `FIRST_AVAILABLE_DATE_CACHE`
 
-這代表：
-
-- 第一次 cold run 仍需下載資料
-- 同一個 app session 內重新回測通常會快很多
+因此第一次 cold run 需要下載資料；相同條件下重跑通常會明顯加快。關閉 app 後 cache 會消失。
 
 ## 安裝
 
+建議使用 virtual environment：
+
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -249,24 +233,28 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## 專案檔案
+啟動後在左側勾選標的，設定回測日期、DCA period、每期投入金額與 Dividend Mode，按下 `Run Backtest` 即可執行。
 
-- `main.py`
-  - GUI
-  - 回測邏輯
-  - 匯率處理
-  - 股利處理
-  - 資料快取
-- `requirements.txt`
-  - 套件依賴
-- `trade_reports/`
-  - 匯出的 Markdown 報表
-- `screenshot.png`
-  - README 使用的畫面截圖
+## 專案結構
+
+```text
+.
+├── main.py
+├── requirements.txt
+├── screenshot.png
+├── trade_reports/
+└── README.md
+```
+
+主要檔案：
+
+- `main.py`：GUI、資料下載、cache、回測邏輯、股利處理、匯率處理與 Markdown 報表輸出。
+- `requirements.txt`：Python package dependencies。
+- `trade_reports/`：回測產出的 Markdown 交易明細。
 
 ## 注意事項
 
-- 本工具屬於 historical backtest，不代表未來績效。
-- `USDT` 目前以 `USD/TWD` 作近似換算，適合一般比較用途，但不是獨立的 stablecoin FX model。
-- 股利資料是否完整，取決於資料來源提供狀況。
-- 報表檔名目前使用秒級時間戳，若同一秒連續匯出，可能覆蓋前一份檔案。
+- 本工具僅供歷史資料回測與研究使用，不構成投資建議。
+- 回測結果受資料來源品質、缺值、匯率資料可用日期與交易日對齊方式影響。
+- Yahoo Finance 與各 Crypto exchange API 可能有 rate limit 或暫時性資料錯誤。
+- `Auto Reinvest Dividends` 使用股利事件對齊後的交易日 close 進行再投入，與實際券商入帳時間可能不同。
